@@ -1,11 +1,13 @@
 'use client';
-import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { Send, Paperclip, ChevronRight, BookOpen, Sparkles, PanelLeftClose, PanelRightClose, FileText, X, ChevronDown,  } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Send, Paperclip, ChevronRight, BookOpen, Sparkles, PanelLeftClose, PanelRightClose, FileText, X, ChevronDown } from 'lucide-react';
 import type { ChatMessage, Citation, Conversation } from './ragChatData';
 import type { SelectedDoc } from './ragChatData';
 import { SUGGESTED_QUESTIONS } from './ragChatData';
 import ChatMessageBubble from './ChatMessageBubble';
 import { addToast } from '@/components/ui/Toast';
+import { useChat } from '@/lib/hooks/useChat';
+import toast from 'react-hot-toast';
 
 interface ChatPanelProps {
   messages: ChatMessage[];
@@ -23,50 +25,6 @@ interface ChatPanelProps {
   activeConvId: string;
 }
 
-const AI_RESPONSES: string[] = [
-  `The **CAP theorem** states that a distributed system can only guarantee two of three properties simultaneously:
-
-- **Consistency (C):** Every read receives the most recent write or an error
-- **Availability (A):** Every request receives a response (not necessarily the most recent data)
-- **Partition tolerance (P):** The system continues operating despite network partitions
-
-Since network partitions are unavoidable in real distributed systems, the practical choice is between **CP** (sacrifice availability — e.g., HBase, Zookeeper) and **AP** (sacrifice strong consistency — e.g., Cassandra, DynamoDB).
-
-Modern systems often implement **eventual consistency** as a middle ground, using techniques like vector clocks, CRDTs, or quorum reads/writes to balance the trade-off.`,
-
-  `**Database indexing** fundamentally changes how the query planner finds rows. Here's when to use each:
-
-**B-Tree index (default):** Best for equality and range queries on high-cardinality columns. Use on columns that appear in WHERE, ORDER BY, or JOIN conditions.
-
-**Composite index:** Index on (col_a, col_b). The leftmost prefix rule applies — a query on just col_b won't use this index. Use when you frequently filter by multiple columns together.
-
-**Covering index:** A composite index that includes all columns a query needs. The engine never touches the main table — it satisfies the query entirely from the index. Dramatic speedup for read-heavy workloads.
-
-**Partial index:** Index only a subset of rows (WHERE status = 'active'). Smaller and faster for queries that always include that filter condition.`,
-
-  `React's **useMemo** and **useCallback** both memoize values to avoid expensive recalculations, but they serve different purposes:
-
-\`useMemo\` memoizes the **result** of a computation:
-\`\`\`js
-const sorted = useMemo(() => items.sort(compareFn), [items]);
-\`\`\`
-
-\`useCallback\` memoizes the **function itself**:
-\`\`\`js
-const handleClick = useCallback(() => doSomething(id), [id]);
-\`\`\`
-
-Use \`useCallback\` when passing callbacks to child components wrapped in \`React.memo\` — otherwise the child re-renders every time the parent renders, even if the callback logic hasn't changed. Use \`useMemo\` for expensive computations like sorting, filtering, or deriving complex state.`,
-];
-
-let aiResponseIndex = 0;
-
-function getNextAIResponse(): string {
-  const resp = AI_RESPONSES[aiResponseIndex % AI_RESPONSES.length];
-  aiResponseIndex++;
-  return resp;
-}
-
 export default function ChatPanel({
   messages, setMessages,
   selectedDocIds, setSelectedDocIds,
@@ -78,11 +36,49 @@ export default function ChatPanel({
   activeConvId,
 }: ChatPanelProps) {
   const [input, setInput] = useState('');
-  const [isStreaming, setIsStreaming] = useState(false);
   const [docSelectorOpen, setDocSelectorOpen] = useState(false);
   const [showSuggestions, setShowSuggestions] = useState(messages.length === 0);
+  const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const { response, isLoading, error, sendMessage } = useChat('OPEN_AI', 'gpt-4o', true);
+
+  useEffect(() => {
+    if (error) toast.error(error.message);
+  }, [error]);
+
+  // Update streaming message content in real-time
+  useEffect(() => {
+    if (streamingMsgId && response) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === streamingMsgId
+            ? { ...m, content: response, isStreaming: isLoading }
+            : m
+        )
+      );
+    }
+  }, [response, isLoading, streamingMsgId, setMessages]);
+
+  // Finalize message when streaming completes
+  useEffect(() => {
+    if (!isLoading && streamingMsgId && response) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === streamingMsgId
+            ? {
+                ...m,
+                content: response,
+                timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+      setStreamingMsgId(null);
+    }
+  }, [isLoading, streamingMsgId, response, setMessages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -94,9 +90,9 @@ export default function ChatPanel({
 
   const selectedDocs = availableDocs.filter((d) => selectedDocIds.includes(d.id));
 
-  const handleSend = async () => {
+  const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text || isLoading) return;
     if (selectedDocIds.length === 0) {
       addToast({ type: 'warning', title: 'No documents selected', description: 'Select at least one document for the AI to reason over.' });
       return;
@@ -112,48 +108,28 @@ export default function ChatPanel({
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setShowSuggestions(false);
-    setIsStreaming(true);
 
-    // Streaming placeholder
     const streamId = `msg-${Date.now()}-ai`;
+    setStreamingMsgId(streamId);
     setMessages((prev) => [
       ...prev,
       { id: streamId, role: 'assistant', content: '', timestamp: '', isStreaming: true },
     ]);
 
-    // BACKEND INTEGRATION: Replace with real RAG API call using axios with JWT interceptor
-    // POST /api/chat { conversationId, message, documentIds }
-    await new Promise((r) => setTimeout(r, 1400));
+    // Build conversation history for multi-turn context
+    const docContext = selectedDocs.map((d) => d.name).join(', ');
+    const systemPrompt = `You are LearnIQ, an intelligent study assistant. The user is studying the following documents: ${docContext}. 
+Answer questions based on these study materials. Provide detailed, educational responses with clear structure using markdown formatting. 
+When referencing specific concepts, be precise and cite the relevant topic area. Help the student understand deeply, not just memorize.`;
 
-    const aiContent = getNextAIResponse();
-    const aiCitations: Citation[] = selectedDocIds.slice(0, 1).map((docId, i) => {
-      const doc = availableDocs.find((d) => d.id === docId);
-      return {
-        id: `cite-${Date.now()}-${i}`,
-        docId,
-        docName: doc?.name ?? 'Unknown',
-        page: Math.floor(Math.random() * 80) + 10,
-        section: `Chapter ${Math.floor(Math.random() * 8) + 1} — Key Concepts`,
-        excerpt: 'This section covers the foundational concepts referenced in the AI response above, including definitions, trade-offs, and real-world application patterns.',
-        relevance: 0.85 + Math.random() * 0.12,
-      };
-    });
+    const apiMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages.map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user', content: text },
+    ];
 
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === streamId
-          ? {
-              ...m,
-              content: aiContent,
-              timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-              citations: aiCitations,
-              isStreaming: false,
-            }
-          : m
-      )
-    );
-    setIsStreaming(false);
-  };
+    sendMessage(apiMessages, { max_completion_tokens: 1500 });
+  }, [input, isLoading, selectedDocIds, selectedDocs, messages, setMessages, sendMessage]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -304,7 +280,7 @@ export default function ChatPanel({
       <div className="flex-shrink-0 px-4 py-4 border-t border-border">
         <div className={`
           flex items-end gap-3 p-3 rounded-2xl border transition-all duration-200
-          ${isStreaming ? 'border-primary/40 bg-primary/5' : 'border-border bg-input hover:border-border/80 focus-within:border-primary/50 focus-within:bg-primary/5'}
+          ${isLoading ? 'border-primary/40 bg-primary/5' : 'border-border bg-input hover:border-border/80 focus-within:border-primary/50 focus-within:bg-primary/5'}
         `}>
           <button
             className="p-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors flex-shrink-0 mb-0.5"
@@ -317,8 +293,8 @@ export default function ChatPanel({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isStreaming ? 'AI is thinking…' : 'Ask a question about your documents… (Enter to send, Shift+Enter for new line)'}
-            disabled={isStreaming}
+            placeholder={isLoading ? 'AI is thinking…' : 'Ask a question about your documents… (Enter to send, Shift+Enter for new line)'}
+            disabled={isLoading}
             rows={1}
             className="flex-1 bg-transparent text-foreground text-sm placeholder:text-muted-foreground/60 focus:outline-none resize-none max-h-32 leading-relaxed disabled:opacity-60"
             style={{ minHeight: '24px' }}
@@ -326,7 +302,7 @@ export default function ChatPanel({
           />
           <button
             onClick={handleSend}
-            disabled={!input.trim() || isStreaming}
+            disabled={!input.trim() || isLoading}
             className="
               flex-shrink-0 p-2 rounded-xl text-white
               bg-gradient-to-r from-primary to-accent
@@ -336,7 +312,7 @@ export default function ChatPanel({
             "
             aria-label="Send message"
           >
-            {isStreaming ? (
+            {isLoading ? (
               <div className="flex items-center gap-0.5">
                 <span className="typing-dot w-1.5 h-1.5 rounded-full bg-white" />
                 <span className="typing-dot w-1.5 h-1.5 rounded-full bg-white" />
@@ -348,7 +324,7 @@ export default function ChatPanel({
           </button>
         </div>
         <p className="text-[11px] text-muted-foreground/60 text-center mt-2">
-          AI answers are grounded in your uploaded documents. Always verify critical information.
+          Powered by OpenAI · Answers grounded in your uploaded documents. Always verify critical information.
         </p>
       </div>
     </div>
